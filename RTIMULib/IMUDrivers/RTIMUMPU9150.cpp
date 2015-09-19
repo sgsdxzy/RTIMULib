@@ -140,10 +140,6 @@ bool RTIMUMPU9150::IMUInit()
 
     m_firstTime = true;
 
-#ifdef MPU9150_CACHE_MODE
-    m_cacheIn = m_cacheOut = m_cacheCount = 0;
-#endif
-
     // set validity flags
 
     m_imuData.fusionPoseValid = false;
@@ -211,15 +207,13 @@ bool RTIMUMPU9150::IMUInit()
 
     //  enable the sensors
 
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_PWR_MGMT_1, 1, "Failed to set pwr_mgmt_1"))
+    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_PWR_MGMT_1, 0x03, "Failed to set clock source to Z gyro"))
         return false;
 
     if (!m_settings->HALWrite(m_slaveAddr, MPU9150_PWR_MGMT_2, 0, "Failed to set pwr_mgmt_2"))
          return false;
 
-    //  select the data to go into the FIFO and enable
-
-    if (!resetFifo())
+    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_INT_ENABLE, 0x01, "Failed to set data ready interrupt"))
         return false;
 
     gyroBiasInit();
@@ -363,32 +357,6 @@ bool RTIMUMPU9150::configureCompass()
     return true;
 }
 
-bool RTIMUMPU9150::resetFifo()
-{
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_INT_ENABLE, 0, "Writing int enable"))
-        return false;
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_FIFO_EN, 0, "Writing fifo enable"))
-        return false;
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_USER_CTRL, 0, "Writing user control"))
-        return false;
-
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_USER_CTRL, 0x04, "Resetting fifo"))
-        return false;
-
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_USER_CTRL, 0x60, "Enabling the fifo"))
-        return false;
-
-    m_settings->delayMs(50);
-
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_INT_ENABLE, 1, "Writing int enable"))
-        return false;
-
-    if (!m_settings->HALWrite(m_slaveAddr, MPU9150_FIFO_EN, 0x78, "Failed to set FIFO enables"))
-        return false;
-
-    return true;
-}
-
 bool RTIMUMPU9150::bypassOn()
 {
     unsigned char userControl;
@@ -461,118 +429,23 @@ bool RTIMUMPU9150::setCompassRate()
 
 int RTIMUMPU9150::IMUGetPollInterval()
 {
-    return (400 / m_sampleRate);
+    return (1000 / m_sampleRate);
 }
 
 bool RTIMUMPU9150::IMURead()
 {
-    unsigned char fifoCount[2];
-    unsigned int count;
-    unsigned char fifoData[12];
-    unsigned char compassData[8];
+    unsigned char data[22];
 
-    if (!m_settings->HALRead(m_slaveAddr, MPU9150_FIFO_COUNT_H, 2, fifoCount, "Failed to read fifo count"))
+    if (!m_settings->HALRead(m_slaveAddr, MPU9150_ACCEL_XOUT_H, 22, data, "Failed to read data"))
          return false;
 
-    count = ((unsigned int)fifoCount[0] << 8) + fifoCount[1];
-
-    if (count == 1024) {
-        HAL_INFO("MPU9150 fifo has overflowed");
-        resetFifo();
-        m_imuData.timestamp += m_sampleInterval * (1024 / MPU9150_FIFO_CHUNK_SIZE + 1); // try to fix timestamp
-        return false;
-    }
-
-
-#ifdef MPU9150_CACHE_MODE
-    if ((m_cacheCount == 0) && (count  >= MPU9150_FIFO_CHUNK_SIZE) && (count < (MPU9150_CACHE_SIZE * MPU9150_FIFO_CHUNK_SIZE))) {
-        // special case of a small fifo and nothing cached - just handle as simple read
-
-        if (!m_settings->HALRead(m_slaveAddr, MPU9150_FIFO_R_W, MPU9150_FIFO_CHUNK_SIZE, fifoData, "Failed to read fifo data"))
-            return false;
-
-        if (!m_settings->HALRead(m_slaveAddr, MPU9150_EXT_SENS_DATA_00, m_compassDataLength, compassData, "Failed to read compass data"))
-            return false;
-    } else {
-        if (count >= (MPU9150_CACHE_SIZE * MPU9150_FIFO_CHUNK_SIZE)) {
-            if (m_cacheCount == MPU9150_CACHE_BLOCK_COUNT) {
-                // all cache blocks are full - discard oldest and update timestamp to account for lost samples
-                m_imuData.timestamp += m_sampleInterval * m_cache[m_cacheOut].count;
-                if (++m_cacheOut == MPU9150_CACHE_BLOCK_COUNT)
-                    m_cacheOut = 0;
-                m_cacheCount--;
-            }
-
-            int blockCount = count / MPU9150_FIFO_CHUNK_SIZE;   // number of chunks in fifo
-
-            if (blockCount > MPU9150_CACHE_SIZE)
-                blockCount = MPU9150_CACHE_SIZE;
-
-            if (!m_settings->HALRead(m_slaveAddr, MPU9150_FIFO_R_W, MPU9150_FIFO_CHUNK_SIZE * blockCount,
-                                m_cache[m_cacheIn].data, "Failed to read fifo data"))
-                return false;
-
-            if (!m_settings->HALRead(m_slaveAddr, MPU9150_EXT_SENS_DATA_00, 8, m_cache[m_cacheIn].compass, "Failed to read compass data"))
-                return false;
-
-            m_cache[m_cacheIn].count = blockCount;
-            m_cache[m_cacheIn].index = 0;
-
-            m_cacheCount++;
-            if (++m_cacheIn == MPU9150_CACHE_BLOCK_COUNT)
-                m_cacheIn = 0;
-
-        }
-
-        //  now fifo has been read if necessary, get something to process
-
-        if (m_cacheCount == 0)
-            return false;
-
-        memcpy(fifoData, m_cache[m_cacheOut].data + m_cache[m_cacheOut].index, MPU9150_FIFO_CHUNK_SIZE);
-        memcpy(compassData, m_cache[m_cacheOut].compass, 8);
-
-        m_cache[m_cacheOut].index += MPU9150_FIFO_CHUNK_SIZE;
-
-        if (--m_cache[m_cacheOut].count == 0) {
-            //  this cache block is now empty
-
-            if (++m_cacheOut == MPU9150_CACHE_BLOCK_COUNT)
-                m_cacheOut = 0;
-            m_cacheCount--;
-        }
-    }
-
-#else
-
-    if (count > MPU9150_FIFO_CHUNK_SIZE * 40) {
-        // more than 40 samples behind - going too slowly so discard some samples but maintain timestamp correctly
-        while (count >= MPU9150_FIFO_CHUNK_SIZE * 10) {
-            if (!m_settings->HALRead(m_slaveAddr, MPU9150_FIFO_R_W, MPU9150_FIFO_CHUNK_SIZE, fifoData, "Failed to read fifo data"))
-                return false;
-            count -= MPU9150_FIFO_CHUNK_SIZE;
-            m_imuData.timestamp += m_sampleInterval;
-        }
-    }
-
-    if (count < MPU9150_FIFO_CHUNK_SIZE)
-        return false;
-
-    if (!m_settings->HALRead(m_slaveAddr, MPU9150_FIFO_R_W, MPU9150_FIFO_CHUNK_SIZE, fifoData, "Failed to read fifo data"))
-        return false;
-
-    if (!m_settings->HALRead(m_slaveAddr, MPU9150_EXT_SENS_DATA_00, m_compassDataLength, compassData, "Failed to read compass data"))
-        return false;
-
-#endif
-
-    RTMath::convertToVector(fifoData, m_imuData.accel, m_accelScale, true);
-    RTMath::convertToVector(fifoData + 6, m_imuData.gyro, m_gyroScale, true);
+    RTMath::convertToVector(data, m_imuData.accel, m_accelScale, true);
+    RTMath::convertToVector(data + 8, m_imuData.gyro, m_gyroScale, true);
 
     if (m_compassIs5883)
-        RTMath::convertToVector(compassData, m_imuData.compass, 0.092f, true);
+        RTMath::convertToVector(data + 14, m_imuData.compass, 0.092f, true);
     else
-        RTMath::convertToVector(compassData + 1, m_imuData.compass, 0.3f, false);
+        RTMath::convertToVector(data + 15, m_imuData.compass, 0.3f, false);
 
     //  sort out gyro axes
 
